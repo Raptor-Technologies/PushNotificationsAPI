@@ -2,6 +2,7 @@
 using Microsoft.Azure.NotificationHubs;
 using Microsoft.Extensions.Options;
 using PushNotificationsAPI.Models;
+using System.Net;
 namespace PushNotificationsAPI.Services;
 
 public class NotificationHubService : INotificationService
@@ -9,8 +10,12 @@ public class NotificationHubService : INotificationService
 	public static string FcmTemplateBody { get; } = "{\"message\":{\"android\":{\"data\":{\"json\":\"$(jsonPayloadParam)\",\"title\":\"$(titleParam)\",\"body\":\"$(bodyParam)\",\"critical\":\"false\"}}}}";
 	public static string FcmCriticalTemplateBody { get; } = "{\"message\":{\"android\":{\"data\":{\"json\":\"$(jsonPayloadParam)\",\"title\":\"$(titleParam)\",\"body\":\"$(bodyParam)\",\"critical\":\"true\",\"sound\":\"$(soundParam)\"},\"priority\":\"high\"}}}";
 
-	public static string ApnNativeBody { get; } = "{\"aps\": {\"alert\" : { \"title\" : \"$(titleParam)\", \"body\" : \"$(bodyParam)\" }, \"json\":\"$(jsonPayloadParam)\"}}";
-	public static string ApnNativeSoundCriticalBody { get; } = "{\"aps\": {\"alert\" : { \"title\" : \"$(titleParam)\", \"body\" : \"$(bodyParam)\" }, \"sound\" : {\"critical\" : 1, \"volume\" : 1.0, \"name\" : \"$(iosSoundParam)\"}, \"json\":\"$(jsonPayloadParam)\"}}";
+	public static string ApnTemplateBody { get; } = "{\"aps\": {\"alert\" : { \"title\" : \"$(titleParam)\", \"body\" : \"$(bodyParam)\" }, \"sound\":\"default\", \"json\":\"$(jsonPayloadParam)\"}}";
+	public static string ApnCriticalTemplateBody { get; } = "{\"aps\": {\"alert\" : { \"title\" : \"$(titleParam)\", \"body\" : \"$(bodyParam)\" }, \"sound\" : {\"critical\" : 1, \"volume\" : 1.0, \"name\" : \"$(iosSoundParam)\"}, \"json\":\"$(jsonPayloadParam)\"}}";
+
+	public static string LegacyFcmTemplateBody { get; } = "{\"message\":{\"android\":{\"data\":{\"json\":\"$(jsonPayloadParam)\",\"title\":\"$(titleParam)\",\"body\":\"$(bodyParam)\",\"critical\":\"$(criticalParam)\",\"sound\":\"$(soundParam)\"},\"priority\":\"$(priorityLParam)\"}}}";
+	public static string LegacyApnTemplateBody { get; } = "{\"aps\":{\"alert\":{\"title\":\"$(titleParam)\", \"body\":\"$(bodyParam)\"}, \"sound\":\"default\", \"json\":\"$(jsonPayloadParam)\"}}";
+
 
 	readonly NotificationHubClient _hub;
 
@@ -21,7 +26,7 @@ public class NotificationHubService : INotificationService
 
 	public async Task<object> GetRegistrationAsync(string tag)
 	{
-		var registrations = await _hub.GetRegistrationsByTagAsync(tag, 1000);
+		var registrations = await _hub.GetRegistrationsByChannelAsync(tag.ToUpper(), 100);
 		return registrations;
 	}
 
@@ -42,11 +47,9 @@ public class NotificationHubService : INotificationService
 					["iosSoundParam"] = (notificationRequest.Sound.ToString() ?? "alert") + ".wav", //keep it separated so we dont require an app update
 				};
 
-				//Select correct template based on critical or not
-				var tagtype = notificationRequest.IsCritical ? ":critical" : ":normal";
-
-				//create expression by batches of 20 tags (max allowed by AHN) combined with "u:" for user and tagtype for :normal or :critical
-				var expression = string.Join(" || ", mTags.Select(a => "u:" + a.ToString() + tagtype).Skip(0).Take(20));
+				//create expression by batches of 20 tags (max allowed by AHN) codwmbined with "u:" for user and tagtype for :normal or :critical
+				var tagType = notificationRequest.IsCritical ? ":critical" : ":normal";
+				var expression = string.Join(" || ", mTags.Select(a => "u:" + a.ToString()+ tagType).Skip(0).Take(20));
 
 				try
 				{
@@ -59,8 +62,8 @@ public class NotificationHubService : INotificationService
 						var timeout = TimeSpan.FromSeconds(5);
 
 						//tiemout of 5 seconds to get the final state
-						while (details.State == NotificationOutcomeState.Processing && 
-						       DateTime.UtcNow - startTime < timeout)
+						while (details.State == NotificationOutcomeState.Processing &&
+							   DateTime.UtcNow - startTime < timeout)
 						{
 							await Task.Delay(500);
 							details = await _hub.GetNotificationOutcomeDetailsAsync(a.NotificationId);
@@ -84,42 +87,80 @@ public class NotificationHubService : INotificationService
 	{
 		try
 		{
-			//get ANH registration for an user
-			var registration = await _hub.GetRegistrationsByTagAsync(request.UserId, 100);
-			if (registration != null)
+			var installation = await _hub.InstallationExistsAsync(request.UserId + "_" + request.Token.Substring(0, 8));
+			if (!installation)
 			{
-				foreach (var reg in registration)
+				//clean up of the token for new flow
+				var registrations = await _hub.GetRegistrationsByChannelAsync(request.Token.ToUpper(), 1000);
+				if (registrations != null)
 				{
-					await _hub.DeleteRegistrationAsync(reg.RegistrationId);
+					foreach (var reg in registrations)
+					{
+						await _hub.DeleteRegistrationAsync(reg);
+					}
 				}
 			}
 
 			var tags = new string[]
 			{
 				"c:" + request.ClientId,
-				"b:" + request.BuildingId,
 				"u:" + request.UserId,
 				"o:" + request.OS
 			};
 
-			//create new templates for the user
-			if (request.OS == "ios")
+			var isIos = request.OS.ToLower() == "ios";
+
+			var legacyTags = new string[]
 			{
-				await _hub.CreateAppleTemplateRegistrationAsync(request.Token, ApnNativeBody, tags.Select(a => a.ToString() + ":normal"));
-				await _hub.CreateAppleTemplateRegistrationAsync(request.Token, ApnNativeSoundCriticalBody, tags.Select(a => a.ToString() + ":critical"));
-			}
-			else
+				request.UserId,
+				isIos ? "iOS" : "Android"
+			};
+
+			// Define the installation
+			var newInstallation = new Installation
 			{
-				await _hub.CreateFcmTemplateRegistrationAsync(request.Token, FcmTemplateBody, tags.Select(a => a.ToString() + ":normal"));
-				await _hub.CreateFcmTemplateRegistrationAsync(request.Token, FcmCriticalTemplateBody, tags.Select(a => a.ToString() + ":critical"));
-			}
+				InstallationId = request.UserId+"_"+request.Token.Substring(0,8),
+				Platform = isIos ? NotificationPlatform.Apns : NotificationPlatform.Fcm,
+				PushChannel = request.Token,
+				Templates = new Dictionary<string, InstallationTemplate>
+				{
+                    // Template 1: Standard notification with alert
+                    {
+						"LegacyTemplate",
+						new InstallationTemplate
+						{
+							Body = isIos ? LegacyApnTemplateBody : LegacyFcmTemplateBody,
+							Tags = legacyTags
+						}
+					},
+                    // Template 2: Critical Notification
+                    {
+						"CriticalTemplate",
+						new InstallationTemplate
+						{
+							Body = isIos ? ApnCriticalTemplateBody : FcmCriticalTemplateBody,
+							Tags = tags.Select(t => t + ":critical").ToList()
+						}
+					},
+                    // Template 3: Normal Notifications
+                    {
+						"NormalTemplate",
+						new InstallationTemplate
+						{
+							Body = isIos ? ApnTemplateBody : FcmTemplateBody,
+							Tags = tags.Select(t => t + ":normal").ToList()
+						}
+					}
+				}
+			};
+
+			await _hub.CreateOrUpdateInstallationAsync(newInstallation);
 
 			return true;
 		}
 		catch (Exception ex)
 		{
-
-			Console.WriteLine($"Error in RegisterOrUpdateiOSTokenAsync: {ex.Message}");
+			Console.WriteLine($"Error in RegisterDeviceAsync: {ex.Message}");
 			return false;
 		}
 	}
@@ -128,7 +169,7 @@ public class NotificationHubService : INotificationService
 	public async Task MigrateClient(long clientID, CancellationToken token)
 	{
 		var users = new List<RegisterTemplateRequest>(); //Get from a query on database
-		foreach(var user in users)
+		foreach (var user in users)
 		{
 			await RegisterDeviceAsync(user, token);
 		}
